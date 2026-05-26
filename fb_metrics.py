@@ -1,18 +1,18 @@
 """
-FB Page metrics puller, auto-discovery edition.
+FB Page metrics puller with For_looker_ready aggregation.
 
-Uses one long-lived User token to fetch all Pages you have admin access
-to via /me/accounts, then pulls metrics for each. Filters out excluded
-Pages and (optionally) restricts to specific FB Page categories.
+Two outputs to the Sheet:
+1. FB_raw (unchanged): daily snapshots, appended each run
+2. For_looker_ready (new): 7-day rolling per-MP aggregate, overwritten each run
+3. Token_Health (unchanged)
 
-Env vars (GitHub Actions secrets):
-    FB_USER_TOKEN        Single long-lived User token (refresh every ~60 days)
-    GOOGLE_CREDS_JSON    Service account JSON
-    SHEET_ID             Google Sheet ID
-    EXCLUDED_PAGE_IDS    JSON list of Page IDs to skip, e.g. ["123", "456"]
-    ALLOWED_CATEGORIES   (optional) JSON list of FB category names to include,
-                         e.g. ["Politician", "Political party"]. If unset or
-                         empty, all categories are included.
+The For_looker_ready tab mirrors the column structure your old leaderboard
+expects, so the existing Looker PERCENTRANK formulas keep working.
+
+The Mapping tab (you maintain manually) is the source of truth for:
+- Which Pages to include in the leaderboard (include=TRUE)
+- Clean MP display names
+- Seat / Party metadata
 """
 
 import json
@@ -20,6 +20,7 @@ import logging
 import os
 import sys
 import time
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -29,6 +30,7 @@ from googleapiclient.discovery import build
 API_VERSION = os.environ.get("FB_API_VERSION", "v23.0")
 BASE_URL = "https://graph.facebook.com"
 LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "1"))
+AGGREGATE_WINDOW_DAYS = int(os.environ.get("AGGREGATE_WINDOW_DAYS", "7"))
 
 RATE_LIMIT_THRESHOLD = 75
 MAX_RETRIES = 5
@@ -36,13 +38,15 @@ BACKOFF_BASE_SECONDS = 30
 
 DATA_SHEET_TAB = "FB_raw"
 HEALTH_SHEET_TAB = "Token_Health"
+MAPPING_TAB = "Mapping"
+FOR_LOOKER_TAB = "For_looker_ready"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# HTTP
+# HTTP (unchanged)
 # ---------------------------------------------------------------------------
 
 def _check_rate_limit(response, page_id):
@@ -119,15 +123,10 @@ def graph_get_paginated(path, params, page_id="", max_pages=50):
 
 
 # ---------------------------------------------------------------------------
-# PAGE DISCOVERY
+# PAGE DISCOVERY (unchanged)
 # ---------------------------------------------------------------------------
 
 def discover_pages(user_token, excluded_ids, allowed_categories):
-    """
-    Calls /me/accounts to get every Page the User token has admin access to.
-    Returns list of dicts: [{"name", "id", "access_token", "category"}, ...]
-    Filtered by excluded_ids and (optionally) allowed_categories.
-    """
     params = {
         "fields": "name,id,access_token,category",
         "limit": 100,
@@ -135,28 +134,22 @@ def discover_pages(user_token, excluded_ids, allowed_categories):
     }
     pages, err = graph_get_paginated("me/accounts", params, "me/accounts")
     if err:
-        log.error("Could not fetch /me/accounts: %s", err)
         return [], err
-
     excluded_set = set(excluded_ids or [])
     allowed_set = set(allowed_categories or [])
-
     filtered = []
     for p in pages:
         if p.get("id") in excluded_set:
-            log.info("Skipping (excluded): %s (%s)", p.get("name"), p.get("id"))
             continue
         if allowed_set and p.get("category") not in allowed_set:
-            log.info("Skipping (category=%s): %s", p.get("category"), p.get("name"))
             continue
         filtered.append(p)
-
     log.info("Discovered %s Pages, %s after filtering", len(pages), len(filtered))
     return filtered, None
 
 
 # ---------------------------------------------------------------------------
-# DATA FETCHING (unchanged from previous version)
+# DATA FETCHING (unchanged)
 # ---------------------------------------------------------------------------
 
 def fetch_page_basics(page_id, token):
@@ -214,15 +207,12 @@ def aggregate(page_info, since_ts, until_ts):
     token = page_info["access_token"]
     label = page_info.get("name", page_id)
     log.info("Processing: %s", label)
-
     basics, err = fetch_page_basics(page_id, token)
     if err:
         return None, err
-
     posts, _ = fetch_posts_in_range(page_id, token, since_ts, until_ts)
     reels, reels_err = fetch_reels_in_range(page_id, token, since_ts, until_ts)
     reels_endpoint_count = None if reels_err else len(reels)
-
     total_shares = total_reactions = total_comments = total_views = 0
     video_count = 0
     for post in posts or []:
@@ -240,7 +230,6 @@ def aggregate(page_info, since_ts, until_ts):
             if "video" in mtype or "video" in atype:
                 video_count += 1
                 break
-
     return {
         "page_name": basics.get("name") or label,
         "page_id": page_id,
@@ -264,6 +253,11 @@ DATA_COLUMNS = [
     "followers_count", "total_posts",
     "reels_posted_dedicated_endpoint", "reels_posted_video_filter",
     "total_views", "total_shares", "total_reactions", "total_comments",
+]
+
+FOR_LOOKER_COLUMNS = [
+    "mp_name", "seat", "party", "new_followers", "posts", "reels",
+    "comments", "reactions", "shares", "views",
 ]
 
 
@@ -305,6 +299,167 @@ def overwrite_sheet(service, sheet_id, tab_name, rows, columns):
     ).execute()
 
 
+def read_mapping(service, sheet_id):
+    """
+    Reads the Mapping tab. Returns dict keyed by page_id:
+        {page_id: {"mp_name": ..., "seat": ..., "party": ..., "include": bool}}
+    Pages not in Mapping won't appear in For_looker_ready.
+    """
+    try:
+        result = service.spreadsheets().values().get(
+            spreadsheetId=sheet_id, range=f"{MAPPING_TAB}!A:E",
+        ).execute()
+    except Exception as e:
+        log.warning("Could not read Mapping tab: %s", e)
+        return {}
+    values = result.get("values", [])
+    if not values or len(values) < 2:
+        log.warning("Mapping tab is empty")
+        return {}
+
+    headers = [h.strip().lower() for h in values[0]]
+    # Expected: page_id, mp_name, seat, party, include
+    required = {"page_id", "mp_name", "include"}
+    if not required.issubset(set(headers)):
+        log.error("Mapping tab missing required columns. Found: %s", headers)
+        return {}
+
+    idx = {h: i for i, h in enumerate(headers)}
+    mapping = {}
+    for row in values[1:]:
+        if not row or len(row) <= idx["page_id"]:
+            continue
+        page_id = str(row[idx["page_id"]]).strip()
+        if not page_id:
+            continue
+        include_raw = row[idx["include"]] if len(row) > idx["include"] else ""
+        include = str(include_raw).strip().upper() in ("TRUE", "YES", "1", "Y")
+        mapping[page_id] = {
+            "mp_name": row[idx["mp_name"]] if len(row) > idx["mp_name"] else "",
+            "seat": row[idx["seat"]] if "seat" in idx and len(row) > idx["seat"] else "",
+            "party": row[idx["party"]] if "party" in idx and len(row) > idx["party"] else "",
+            "include": include,
+        }
+    log.info("Loaded %s entries from Mapping tab (%s included)",
+             len(mapping), sum(1 for v in mapping.values() if v["include"]))
+    return mapping
+
+
+def read_recent_fb_raw(service, sheet_id, days):
+    """
+    Reads all FB_raw rows, returns list of dicts for rows where
+    run_date falls within the last N days.
+    """
+    try:
+        result = service.spreadsheets().values().get(
+            spreadsheetId=sheet_id, range=f"{DATA_SHEET_TAB}!A:Z",
+        ).execute()
+    except Exception as e:
+        log.error("Could not read FB_raw: %s", e)
+        return []
+    values = result.get("values", [])
+    if not values or len(values) < 2:
+        return []
+
+    headers = values[0]
+    cutoff = datetime.now(timezone.utc).date() - timedelta(days=days)
+    rows = []
+    for row in values[1:]:
+        # Pad short rows
+        padded = row + [""] * (len(headers) - len(row))
+        row_dict = dict(zip(headers, padded))
+        run_date_str = row_dict.get("run_date", "")
+        try:
+            run_date = datetime.strptime(run_date_str, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if run_date >= cutoff:
+            rows.append(row_dict)
+    log.info("Read %s rows from FB_raw within last %s days", len(rows), days)
+    return rows
+
+
+def build_for_looker(mapping, recent_rows):
+    """
+    Aggregates last N days of FB_raw into per-MP rows matching the old
+    For_looker structure.
+
+    Strategy per metric:
+    - followers: take MAX in window (since followers_count is a snapshot, not a delta).
+                 To match old "New_Followers" semantics: MAX - MIN in window.
+    - posts/reels/views/shares/reactions/comments: SUM across the window
+      (since the script writes daily snapshots of "metrics on posts published
+      in the period". Daily LOOKBACK_DAYS=1 means each row is one day's posts.)
+    """
+    # Group rows by page_id
+    by_page = defaultdict(list)
+    for row in recent_rows:
+        pid = str(row.get("page_id", "")).strip()
+        if pid:
+            by_page[pid].append(row)
+
+    out = []
+    for page_id, page_rows in by_page.items():
+        map_entry = mapping.get(page_id)
+        if not map_entry or not map_entry["include"]:
+            continue
+
+        followers_values = []
+        sum_posts = sum_reels = sum_views = sum_shares = sum_reactions = sum_comments = 0
+        for r in page_rows:
+            try:
+                f = int(r.get("followers_count") or 0)
+                if f > 0:
+                    followers_values.append(f)
+            except (TypeError, ValueError):
+                pass
+            for src, dst_name in [
+                ("total_posts", "posts"),
+                ("reels_posted_dedicated_endpoint", "reels"),
+                ("total_views", "views"),
+                ("total_shares", "shares"),
+                ("total_reactions", "reactions"),
+                ("total_comments", "comments"),
+            ]:
+                try:
+                    v = int(r.get(src) or 0)
+                except (TypeError, ValueError):
+                    v = 0
+                if dst_name == "posts":
+                    sum_posts += v
+                elif dst_name == "reels":
+                    sum_reels += v
+                elif dst_name == "views":
+                    sum_views += v
+                elif dst_name == "shares":
+                    sum_shares += v
+                elif dst_name == "reactions":
+                    sum_reactions += v
+                elif dst_name == "comments":
+                    sum_comments += v
+
+        # New followers = max - min across the window. If only one snapshot, = 0.
+        new_followers = (max(followers_values) - min(followers_values)) if len(followers_values) >= 2 else 0
+
+        out.append({
+            "mp_name": map_entry["mp_name"],
+            "seat": map_entry["seat"],
+            "party": map_entry["party"],
+            "new_followers": new_followers,
+            "posts": sum_posts,
+            "reels": sum_reels,
+            "comments": sum_comments,
+            "reactions": sum_reactions,
+            "shares": sum_shares,
+            "views": sum_views,
+        })
+
+    # Sort by MP name for stable ordering
+    out.sort(key=lambda r: (r["mp_name"] or "").lower())
+    log.info("Built For_looker_ready with %s rows", len(out))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
@@ -317,7 +472,6 @@ def main():
         log.error("Missing required env var: %s", e)
         sys.exit(1)
 
-    # Optional filters
     excluded_raw = os.environ.get("EXCLUDED_PAGE_IDS", "[]")
     allowed_raw = os.environ.get("ALLOWED_CATEGORIES", "[]")
     try:
@@ -337,20 +491,19 @@ def main():
 
     log.info("Run: %s | period %s to %s", run_date, period_start, period_end)
 
-    # Step 1: discover Pages via User token
+    service = get_sheets_service()
+
+    # Step 1: discover Pages
     pages, discovery_err = discover_pages(user_token, excluded_ids, allowed_categories)
     health_rows = []
-
     if discovery_err:
-        # User token itself is dead. Write that to health sheet and bail.
         health_rows.append({
             "page_name": "USER_TOKEN", "page_id": "-", "status": "FAILED",
             "detail": discovery_err, "checked_at": run_date,
         })
-        service = get_sheets_service()
         overwrite_sheet(service, sheet_id, HEALTH_SHEET_TAB, health_rows,
                         ["page_name", "page_id", "status", "detail", "checked_at"])
-        log.error("User token failed. Regenerate it. Aborting.")
+        log.error("User token failed. Aborting.")
         sys.exit(2)
 
     health_rows.append({
@@ -358,7 +511,7 @@ def main():
         "detail": f"Discovered {len(pages)} Pages", "checked_at": run_date,
     })
 
-    # Step 2: pull metrics for each Page
+    # Step 2: pull metrics
     data_rows = []
     for page_info in pages:
         try:
@@ -384,13 +537,24 @@ def main():
                 "status": "CRASHED", "detail": str(e), "checked_at": run_date,
             })
 
-    # Step 3: write to Sheets
-    service = get_sheets_service()
+    # Step 3: write today's data to FB_raw (append)
     if data_rows:
         append_to_sheet(service, sheet_id, DATA_SHEET_TAB, data_rows, DATA_COLUMNS)
         log.info("Appended %s rows to %s", len(data_rows), DATA_SHEET_TAB)
+
+    # Step 4: write Token_Health
     overwrite_sheet(service, sheet_id, HEALTH_SHEET_TAB, health_rows,
                     ["page_name", "page_id", "status", "detail", "checked_at"])
+
+    # Step 5: build For_looker_ready
+    # We read FB_raw fresh so it includes the row we just appended
+    mapping = read_mapping(service, sheet_id)
+    if mapping:
+        recent = read_recent_fb_raw(service, sheet_id, AGGREGATE_WINDOW_DAYS)
+        for_looker_rows = build_for_looker(mapping, recent)
+        overwrite_sheet(service, sheet_id, FOR_LOOKER_TAB, for_looker_rows, FOR_LOOKER_COLUMNS)
+    else:
+        log.warning("Skipping For_looker_ready: no Mapping data")
 
     failed = [r for r in health_rows if r["status"] != "OK"]
     if failed:
