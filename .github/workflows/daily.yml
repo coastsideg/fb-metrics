@@ -1,0 +1,29 @@
+name: FB Metrics Daily Pull
+
+on:
+  schedule:
+    - cron: '0 22 * * *'
+  workflow_dispatch:
+
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run puller
+        env:
+          FB_TOKENS_JSON: ${{ secrets.FB_TOKENS_JSON }}
+          PAGES_CONFIG_JSON: ${{ secrets.PAGES_CONFIG_JSON }}
+          GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          FB_API_VERSION: v23.0
+          LOOKBACK_DAYS: '1'
+        run: python fb_metrics.py
