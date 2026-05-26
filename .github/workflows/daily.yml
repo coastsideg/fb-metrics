@@ -20,7 +20,6 @@ jobs:
 
       - name: Run puller
         env:
-env:
           FB_USER_TOKEN: ${{ secrets.FB_USER_TOKEN }}
           GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
