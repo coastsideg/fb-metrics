@@ -20,10 +20,12 @@ jobs:
 
       - name: Run puller
         env:
-          FB_TOKENS_JSON: ${{ secrets.FB_TOKENS_JSON }}
-          PAGES_CONFIG_JSON: ${{ secrets.PAGES_CONFIG_JSON }}
+env:
+          FB_USER_TOKEN: ${{ secrets.FB_USER_TOKEN }}
           GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
+          EXCLUDED_PAGE_IDS: ${{ secrets.EXCLUDED_PAGE_IDS }}
+          ALLOWED_CATEGORIES: ${{ secrets.ALLOWED_CATEGORIES }}
           FB_API_VERSION: v23.0
           LOOKBACK_DAYS: '1'
         run: python fb_metrics.py
