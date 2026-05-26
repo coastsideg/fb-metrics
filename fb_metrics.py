@@ -1,23 +1,20 @@
 """
-FB Page metrics puller, daily edition.
+FB Page metrics puller, auto-discovery edition.
 
-Designed for a piecemeal-token reality: pulls from however many Pages you
-currently have tokens for, reports dead tokens loudly, keeps going.
+Uses one long-lived User token to fetch all Pages you have admin access
+to via /me/accounts, then pulls metrics for each. Filters out excluded
+Pages and (optionally) restricts to specific FB Page categories.
 
-Writes to a Google Sheet so Looker Studio always sees fresh data.
-
-Environment variables expected (set as GitHub Actions secrets):
-    FB_TOKENS_JSON       JSON string: {"page_id_or_label": "token", ...}
-    GOOGLE_CREDS_JSON    Service account JSON (whole file as one string)
-    SHEET_ID             Google Sheet ID (from the URL)
-    PAGES_CONFIG_JSON    JSON list: [{"name": "...", "page_id": "..."}, ...]
-
-Why split tokens from pages config: tokens rotate, the page list is stable.
-Editing one secret is easier than editing a YAML and redeploying.
+Env vars (GitHub Actions secrets):
+    FB_USER_TOKEN        Single long-lived User token (refresh every ~60 days)
+    GOOGLE_CREDS_JSON    Service account JSON
+    SHEET_ID             Google Sheet ID
+    EXCLUDED_PAGE_IDS    JSON list of Page IDs to skip, e.g. ["123", "456"]
+    ALLOWED_CATEGORIES   (optional) JSON list of FB category names to include,
+                         e.g. ["Politician", "Political party"]. If unset or
+                         empty, all categories are included.
 """
 
-import csv
-import io
 import json
 import logging
 import os
@@ -29,38 +26,26 @@ import requests
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
-# ---------------------------------------------------------------------------
-# CONSTANTS
-# ---------------------------------------------------------------------------
-
-# Bump when Meta deprecates. Check changelog:
-# https://developers.facebook.com/docs/graph-api/changelog
 API_VERSION = os.environ.get("FB_API_VERSION", "v23.0")
 BASE_URL = "https://graph.facebook.com"
-
-LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "1"))  # daily run = 1 day
+LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "1"))
 
 RATE_LIMIT_THRESHOLD = 75
 MAX_RETRIES = 5
 BACKOFF_BASE_SECONDS = 30
 
-# Sheet tab names. Create these tabs manually in your Sheet first.
-DATA_SHEET_TAB = "FB_raw"          # daily appended rows for Looker
-HEALTH_SHEET_TAB = "Token_Health"  # latest token status snapshot
+DATA_SHEET_TAB = "FB_raw"
+HEALTH_SHEET_TAB = "Token_Health"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# HTTP / RATE LIMIT
+# HTTP
 # ---------------------------------------------------------------------------
 
 def _check_rate_limit(response, page_id):
-    """Sleep if BUC header shows we're approaching limits."""
     header = response.headers.get("X-Business-Use-Case-Usage") or response.headers.get("X-App-Usage")
     if not header:
         return
@@ -68,20 +53,16 @@ def _check_rate_limit(response, page_id):
         usage = json.loads(header)
     except json.JSONDecodeError:
         return
-
     metrics_list = []
     if isinstance(usage, dict):
         if page_id in usage:
             metrics_list = usage[page_id] if isinstance(usage[page_id], list) else [usage[page_id]]
         else:
             metrics_list = [usage]
-
     for metrics in metrics_list:
         if not isinstance(metrics, dict):
             continue
-        max_pct = max(
-            (metrics.get(k, 0) or 0) for k in ("call_count", "total_cputime", "total_time")
-        )
+        max_pct = max((metrics.get(k, 0) or 0) for k in ("call_count", "total_cputime", "total_time"))
         if max_pct >= RATE_LIMIT_THRESHOLD:
             sleep_for = 60 + (max_pct - RATE_LIMIT_THRESHOLD) * 2
             log.warning("Rate limit %s%% for %s, sleeping %ss", max_pct, page_id, sleep_for)
@@ -89,9 +70,7 @@ def _check_rate_limit(response, page_id):
 
 
 def graph_get(path, params, page_id=""):
-    """GET with retry. Returns (data, error_message). error_message is None on success."""
     url = f"{BASE_URL}/{API_VERSION}/{path}"
-
     for attempt in range(MAX_RETRIES):
         try:
             response = requests.get(url, params=params, timeout=30)
@@ -99,34 +78,22 @@ def graph_get(path, params, page_id=""):
             log.warning("Network error: %s", e)
             time.sleep(BACKOFF_BASE_SECONDS * (2 ** attempt))
             continue
-
         _check_rate_limit(response, page_id)
-
         if response.status_code == 200:
             return response.json(), None
-
         try:
             err = response.json().get("error", {})
             code = err.get("code")
             subcode = err.get("error_subcode")
             msg = err.get("message", "")
-            err_type = err.get("type", "")
         except (ValueError, AttributeError):
             return None, f"HTTP {response.status_code}"
-
-        # Token errors are NOT retryable, surface immediately so we can report
-        # which Pages need their tokens refreshed.
-        # 190 = invalid token, 102 = session expired, 463 = expired,
-        # 467 = invalid access token, 200 = permissions error
         if code in (190, 102, 463, 467, 200):
             return None, f"TOKEN_DEAD: code={code} subcode={subcode} {msg}"
-
         retryable = code in (1, 2, 4, 17, 32, 613, 80004) or response.status_code in (429, 500, 502, 503, 504)
         if not retryable:
             return None, f"code={code} {msg}"
-
         time.sleep(BACKOFF_BASE_SECONDS * (2 ** attempt))
-
     return None, "max_retries_exceeded"
 
 
@@ -152,27 +119,48 @@ def graph_get_paginated(path, params, page_id="", max_pages=50):
 
 
 # ---------------------------------------------------------------------------
-# DATA FETCHING
+# PAGE DISCOVERY
 # ---------------------------------------------------------------------------
 
-def check_token(page_id, token):
+def discover_pages(user_token, excluded_ids, allowed_categories):
     """
-    Quick sanity ping to see if the token works. Returns (ok, message).
-    Run this for every Page before doing real work, so we get a clean
-    health report instead of partial failures mid-run.
+    Calls /me/accounts to get every Page the User token has admin access to.
+    Returns list of dicts: [{"name", "id", "access_token", "category"}, ...]
+    Filtered by excluded_ids and (optionally) allowed_categories.
     """
-    data, err = graph_get(page_id, {"fields": "name", "access_token": token}, page_id)
+    params = {
+        "fields": "name,id,access_token,category",
+        "limit": 100,
+        "access_token": user_token,
+    }
+    pages, err = graph_get_paginated("me/accounts", params, "me/accounts")
     if err:
-        return False, err
-    return True, data.get("name", "")
+        log.error("Could not fetch /me/accounts: %s", err)
+        return [], err
 
+    excluded_set = set(excluded_ids or [])
+    allowed_set = set(allowed_categories or [])
+
+    filtered = []
+    for p in pages:
+        if p.get("id") in excluded_set:
+            log.info("Skipping (excluded): %s (%s)", p.get("name"), p.get("id"))
+            continue
+        if allowed_set and p.get("category") not in allowed_set:
+            log.info("Skipping (category=%s): %s", p.get("category"), p.get("name"))
+            continue
+        filtered.append(p)
+
+    log.info("Discovered %s Pages, %s after filtering", len(pages), len(filtered))
+    return filtered, None
+
+
+# ---------------------------------------------------------------------------
+# DATA FETCHING (unchanged from previous version)
+# ---------------------------------------------------------------------------
 
 def fetch_page_basics(page_id, token):
-    data, err = graph_get(
-        page_id,
-        {"fields": "name,followers_count,fan_count", "access_token": token},
-        page_id,
-    )
+    data, err = graph_get(page_id, {"fields": "name,followers_count,fan_count", "access_token": token}, page_id)
     if err:
         return None, err
     followers = data.get("followers_count")
@@ -201,16 +189,10 @@ def fetch_posts_in_range(page_id, token, since_ts, until_ts):
 
 
 def fetch_reels_in_range(page_id, token, since_ts, until_ts):
-    """
-    /video_reels is the dedicated Reels endpoint. Fragile but accurate.
-    If Meta deprecates this, the broader video count from fetch_posts_in_range
-    is our fallback signal.
-    """
     params = {"fields": "id,created_time", "limit": 100, "access_token": token}
     reels, err = graph_get_paginated(f"{page_id}/video_reels", params, page_id)
     if err:
         return [], err
-
     since_dt = datetime.fromtimestamp(since_ts, tz=timezone.utc)
     until_dt = datetime.fromtimestamp(until_ts, tz=timezone.utc)
     filtered = []
@@ -227,40 +209,30 @@ def fetch_reels_in_range(page_id, token, since_ts, until_ts):
     return filtered, None
 
 
-# ---------------------------------------------------------------------------
-# AGGREGATION
-# ---------------------------------------------------------------------------
-
-def aggregate(page_cfg, token, since_ts, until_ts):
-    page_id = page_cfg["page_id"]
-    label = page_cfg.get("name", page_id)
+def aggregate(page_info, since_ts, until_ts):
+    page_id = page_info["id"]
+    token = page_info["access_token"]
+    label = page_info.get("name", page_id)
     log.info("Processing: %s", label)
 
     basics, err = fetch_page_basics(page_id, token)
     if err:
         return None, err
 
-    posts, posts_err = fetch_posts_in_range(page_id, token, since_ts, until_ts)
+    posts, _ = fetch_posts_in_range(page_id, token, since_ts, until_ts)
     reels, reels_err = fetch_reels_in_range(page_id, token, since_ts, until_ts)
-
-    # reels_err being TOKEN_DEAD here would have been caught earlier in
-    # check_token. If /video_reels itself is broken (Meta change), we still
-    # want to return the rest of the data, just with reels count as null.
     reels_endpoint_count = None if reels_err else len(reels)
 
     total_shares = total_reactions = total_comments = total_views = 0
     video_count = 0
-
     for post in posts or []:
         total_shares += (post.get("shares") or {}).get("count", 0) or 0
         total_reactions += (post.get("reactions", {}).get("summary") or {}).get("total_count", 0) or 0
         total_comments += (post.get("comments", {}).get("summary") or {}).get("total_count", 0) or 0
-
         for insight in (post.get("insights", {}).get("data") or []):
             if insight.get("name") == "post_video_views":
                 vals = insight.get("values") or [{}]
                 total_views += vals[0].get("value", 0) or 0
-
         atts = (post.get("attachments") or {}).get("data") or []
         for att in atts:
             mtype = (att.get("media_type") or "").lower()
@@ -284,7 +256,7 @@ def aggregate(page_cfg, token, since_ts, until_ts):
 
 
 # ---------------------------------------------------------------------------
-# GOOGLE SHEETS OUTPUT
+# SHEETS
 # ---------------------------------------------------------------------------
 
 DATA_COLUMNS = [
@@ -296,57 +268,40 @@ DATA_COLUMNS = [
 
 
 def get_sheets_service():
-    creds_json = os.environ["GOOGLE_CREDS_JSON"]
-    creds_info = json.loads(creds_json)
+    creds_info = json.loads(os.environ["GOOGLE_CREDS_JSON"])
     creds = Credentials.from_service_account_info(
-        creds_info,
-        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        creds_info, scopes=["https://www.googleapis.com/auth/spreadsheets"],
     )
     return build("sheets", "v4", credentials=creds)
 
 
 def append_to_sheet(service, sheet_id, tab_name, rows, columns):
-    """
-    Appends rows to a Sheet tab. Creates header if tab is empty.
-    """
-    # Check if header exists
     result = service.spreadsheets().values().get(
-        spreadsheetId=sheet_id,
-        range=f"{tab_name}!A1:Z1",
+        spreadsheetId=sheet_id, range=f"{tab_name}!A1:Z1",
     ).execute()
     existing = result.get("values", [])
-
     values_to_append = []
     if not existing:
         values_to_append.append(columns)
-
     for row in rows:
         values_to_append.append([row.get(col, "") for col in columns])
-
     service.spreadsheets().values().append(
-        spreadsheetId=sheet_id,
-        range=f"{tab_name}!A1",
-        valueInputOption="RAW",
-        insertDataOption="INSERT_ROWS",
+        spreadsheetId=sheet_id, range=f"{tab_name}!A1",
+        valueInputOption="RAW", insertDataOption="INSERT_ROWS",
         body={"values": values_to_append},
     ).execute()
 
 
 def overwrite_sheet(service, sheet_id, tab_name, rows, columns):
-    """For the health tab: latest snapshot, not historical."""
     values = [columns]
     for row in rows:
         values.append([row.get(col, "") for col in columns])
-
     service.spreadsheets().values().clear(
-        spreadsheetId=sheet_id,
-        range=f"{tab_name}!A:Z",
+        spreadsheetId=sheet_id, range=f"{tab_name}!A:Z",
     ).execute()
     service.spreadsheets().values().update(
-        spreadsheetId=sheet_id,
-        range=f"{tab_name}!A1",
-        valueInputOption="RAW",
-        body={"values": values},
+        spreadsheetId=sheet_id, range=f"{tab_name}!A1",
+        valueInputOption="RAW", body={"values": values},
     ).execute()
 
 
@@ -355,16 +310,21 @@ def overwrite_sheet(service, sheet_id, tab_name, rows, columns):
 # ---------------------------------------------------------------------------
 
 def main():
-    # Load config from env (GitHub Actions secrets)
     try:
-        tokens = json.loads(os.environ["FB_TOKENS_JSON"])
-        pages = json.loads(os.environ["PAGES_CONFIG_JSON"])
+        user_token = os.environ["FB_USER_TOKEN"]
         sheet_id = os.environ["SHEET_ID"]
     except KeyError as e:
-        log.error("Missing env var: %s", e)
+        log.error("Missing required env var: %s", e)
         sys.exit(1)
+
+    # Optional filters
+    excluded_raw = os.environ.get("EXCLUDED_PAGE_IDS", "[]")
+    allowed_raw = os.environ.get("ALLOWED_CATEGORIES", "[]")
+    try:
+        excluded_ids = json.loads(excluded_raw)
+        allowed_categories = json.loads(allowed_raw)
     except json.JSONDecodeError as e:
-        log.error("Bad JSON in env: %s", e)
+        log.error("Bad JSON in EXCLUDED_PAGE_IDS or ALLOWED_CATEGORIES: %s", e)
         sys.exit(1)
 
     now = datetime.now(timezone.utc)
@@ -375,73 +335,66 @@ def main():
     period_start = since_dt.strftime("%Y-%m-%d")
     period_end = now.strftime("%Y-%m-%d")
 
-    log.info("Run: %s | period %s to %s | %s pages", run_date, period_start, period_end, len(pages))
+    log.info("Run: %s | period %s to %s", run_date, period_start, period_end)
 
-    # Step 1: token health check for all Pages upfront
+    # Step 1: discover Pages via User token
+    pages, discovery_err = discover_pages(user_token, excluded_ids, allowed_categories)
     health_rows = []
-    valid_pages = []
-    for page_cfg in pages:
-        page_id = page_cfg["page_id"]
-        label = page_cfg.get("name", page_id)
-        token_key = page_cfg.get("token_key", page_id)
-        token = tokens.get(token_key)
 
-        if not token:
-            health_rows.append({
-                "page_name": label, "page_id": page_id, "status": "MISSING_TOKEN",
-                "detail": f"No token found for key '{token_key}'", "checked_at": run_date,
-            })
-            continue
+    if discovery_err:
+        # User token itself is dead. Write that to health sheet and bail.
+        health_rows.append({
+            "page_name": "USER_TOKEN", "page_id": "-", "status": "FAILED",
+            "detail": discovery_err, "checked_at": run_date,
+        })
+        service = get_sheets_service()
+        overwrite_sheet(service, sheet_id, HEALTH_SHEET_TAB, health_rows,
+                        ["page_name", "page_id", "status", "detail", "checked_at"])
+        log.error("User token failed. Regenerate it. Aborting.")
+        sys.exit(2)
 
-        ok, msg = check_token(page_id, token)
-        if ok:
-            health_rows.append({
-                "page_name": label, "page_id": page_id, "status": "OK",
-                "detail": msg, "checked_at": run_date,
-            })
-            valid_pages.append((page_cfg, token))
-        else:
-            health_rows.append({
-                "page_name": label, "page_id": page_id, "status": "FAILED",
-                "detail": msg, "checked_at": run_date,
-            })
+    health_rows.append({
+        "page_name": "USER_TOKEN", "page_id": "-", "status": "OK",
+        "detail": f"Discovered {len(pages)} Pages", "checked_at": run_date,
+    })
 
-    ok_count = sum(1 for r in health_rows if r["status"] == "OK")
-    dead = [r for r in health_rows if r["status"] != "OK"]
-    log.info("Token health: %s OK, %s dead", ok_count, len(dead))
-    for d in dead:
-        log.warning("  DEAD: %s (%s) - %s", d["page_name"], d["page_id"], d["detail"])
-
-    # Step 2: pull data for valid Pages
+    # Step 2: pull metrics for each Page
     data_rows = []
-    for page_cfg, token in valid_pages:
+    for page_info in pages:
         try:
-            row, err = aggregate(page_cfg, token, since_ts, until_ts)
+            row, err = aggregate(page_info, since_ts, until_ts)
             if err:
-                log.error("Failed: %s - %s", page_cfg.get("name"), err)
+                health_rows.append({
+                    "page_name": page_info.get("name"), "page_id": page_info.get("id"),
+                    "status": "FAILED", "detail": err, "checked_at": run_date,
+                })
                 continue
             row["run_date"] = run_date
             row["period_start"] = period_start
             row["period_end"] = period_end
             data_rows.append(row)
+            health_rows.append({
+                "page_name": page_info.get("name"), "page_id": page_info.get("id"),
+                "status": "OK", "detail": "", "checked_at": run_date,
+            })
         except Exception as e:
-            log.exception("Crash on %s: %s", page_cfg.get("name"), e)
+            log.exception("Crash on %s: %s", page_info.get("name"), e)
+            health_rows.append({
+                "page_name": page_info.get("name"), "page_id": page_info.get("id"),
+                "status": "CRASHED", "detail": str(e), "checked_at": run_date,
+            })
 
     # Step 3: write to Sheets
     service = get_sheets_service()
     if data_rows:
         append_to_sheet(service, sheet_id, DATA_SHEET_TAB, data_rows, DATA_COLUMNS)
         log.info("Appended %s rows to %s", len(data_rows), DATA_SHEET_TAB)
-    overwrite_sheet(
-        service, sheet_id, HEALTH_SHEET_TAB, health_rows,
-        ["page_name", "page_id", "status", "detail", "checked_at"],
-    )
-    log.info("Wrote health snapshot to %s", HEALTH_SHEET_TAB)
+    overwrite_sheet(service, sheet_id, HEALTH_SHEET_TAB, health_rows,
+                    ["page_name", "page_id", "status", "detail", "checked_at"])
 
-    # Exit non-zero if any tokens are dead, so GitHub Actions shows a red X
-    # and you actually notice. Comment this out if you want it always green.
-    if dead:
-        log.warning("Run completed but %s tokens need attention", len(dead))
+    failed = [r for r in health_rows if r["status"] != "OK"]
+    if failed:
+        log.warning("%s issues, see Token_Health tab", len(failed))
         sys.exit(2)
 
 
