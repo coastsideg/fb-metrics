@@ -134,6 +134,7 @@ def discover_pages(user_token, excluded_ids, allowed_categories):
     }
     pages, err = graph_get_paginated("me/accounts", params, "me/accounts")
     if err:
+        log.error("discover_pages failed with error: %s", err)
         return [], err
     excluded_set = set(excluded_ids or [])
     allowed_set = set(allowed_categories or [])
@@ -540,6 +541,11 @@ def main():
     period_end = now.strftime("%Y-%m-%d")
 
     log.info("Run: %s | period %s to %s", run_date, period_start, period_end)
+    # Diagnostic: show token length and first/last few chars to detect corruption.
+    # Never log the full token.
+    token_len = len(user_token)
+    token_preview = f"{user_token[:8]}...{user_token[-6:]}" if token_len > 14 else "TOO_SHORT"
+    log.info("FB_USER_TOKEN: length=%s preview=%s", token_len, token_preview)
 
     service = get_sheets_service()
 
