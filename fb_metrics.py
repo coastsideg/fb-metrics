@@ -257,8 +257,55 @@ DATA_COLUMNS = [
 
 FOR_LOOKER_COLUMNS = [
     "mp_name", "seat", "party", "new_followers", "posts", "reels",
-    "comments", "reactions", "shares", "views",
+    "comments", "reactions", "shares", "views", "score",
 ]
+
+# Score weights, must total 100.
+# Matches the original PERCENTRANK leaderboard scoring.
+SCORE_WEIGHTS = {
+    "reels": 25,
+    "views": 20,
+    "posts": 15,
+    "new_followers": 15,
+    "shares": 10,
+    "reactions": 10,
+    "comments": 5,
+}
+
+
+def percent_rank(values, target):
+    """
+    Replicates Google Sheets PERCENTRANK behaviour.
+    Returns the relative rank of `target` within `values` as 0.0 to 1.0.
+    Ties get the lower rank. If only one value, returns 1.0.
+    """
+    if not values or len(values) == 1:
+        return 1.0
+    sorted_vals = sorted(values)
+    n = len(sorted_vals)
+    # Count values strictly less than target
+    below = sum(1 for v in sorted_vals if v < target)
+    return below / (n - 1)
+
+
+def compute_scores(rows):
+    """
+    Adds a 'score' field to each row based on PERCENTRANK across all rows.
+    Score = sum(percentile_rank(metric) * weight) for each weighted metric.
+    Result is 0 to 100.
+    """
+    if not rows:
+        return rows
+    # Pre-compute all values per metric
+    metric_values = {m: [r.get(m, 0) or 0 for r in rows] for m in SCORE_WEIGHTS}
+    for row in rows:
+        total = 0.0
+        for metric, weight in SCORE_WEIGHTS.items():
+            val = row.get(metric, 0) or 0
+            pr = percent_rank(metric_values[metric], val)
+            total += pr * weight
+        row["score"] = round(total, 1)
+    return rows
 
 
 def get_sheets_service():
@@ -454,8 +501,11 @@ def build_for_looker(mapping, recent_rows):
             "views": sum_views,
         })
 
-    # Sort by MP name for stable ordering
-    out.sort(key=lambda r: (r["mp_name"] or "").lower())
+    # Compute leaderboard scores using PERCENTRANK across all included MPs
+    out = compute_scores(out)
+
+    # Sort by score descending (best at top) so the Sheet looks like a leaderboard
+    out.sort(key=lambda r: r.get("score", 0), reverse=True)
     log.info("Built For_looker_ready with %s rows", len(out))
     return out
 
