@@ -2,7 +2,7 @@ name: FB Metrics Daily Pull
 
 on:
   schedule:
-    - cron: '0 22 * * 0'  # Sunday 22:00 UTC = Monday 06:00 Perth (UTC+8)
+    - cron: '0 22 * * *'  # 22:00 UTC daily = 06:00 Perth (UTC+8)
   workflow_dispatch:
 
 jobs:
